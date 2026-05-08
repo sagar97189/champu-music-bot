@@ -16,7 +16,6 @@ import logging
 import yt_dlp
 import subprocess
 import random
-import ollama
 from dotenv import load_dotenv
 
 # Load Environment Variables (.env)
@@ -66,19 +65,8 @@ CLI_CHAT_ID = int(os.getenv("CLI_CHAT_ID", "0"))
 VOLUME_LOCK_ENABLED = os.getenv("VOLUME_LOCK_ENABLED", "1").lower() in ("1", "true", "yes", "on")
 VOLUME_LOCK_LEVEL = max(1, min(int(os.getenv("VOLUME_LOCK_LEVEL", "200")), 200))
 VOLUME_LOCK_INTERVAL = max(2, int(os.getenv("VOLUME_LOCK_INTERVAL", "10")))
-# AI Settings (Ollama Local)
-OLLAMA_MODEL = "mistral"
-AI_ENABLED = True # Local AI is always available if Ollama is running
 
-AUTOCHAT_INTERVAL = max(15, int(os.getenv("AUTOCHAT_INTERVAL", "60")))
-AUTOCHAT_MESSAGES = [
-    msg.strip()
-    for msg in os.getenv(
-        "AUTOCHAT_MESSAGES",
-        "VC is live;Drop your song requests;Use /play song name;Champu is in the voice chat"
-    ).split(";")
-    if msg.strip()
-]
+# --- 2. Configuration (Loaded from Environment) ---
 SILENT_AUDIO_SOURCE = "anullsrc=channel_layout=stereo:sample_rate=48000"
 SILENT_AUDIO_FFMPEG_PARAMS = "--audio-start -f lavfi"
 
@@ -95,13 +83,8 @@ call_py = PyTgCalls(assistant)
 active_calls = {}
 volume_lock_tasks = {}
 volume_lock_levels = {}
-autochat_tasks = {}
-autochat_intervals = {}
-autochat_messages = {}
 # Track the service message ID for VC comments
 active_vc_message_ids = {}
-# Global toggle for instant auto-reply
-AUTO_REPLY_ENABLED = False
 
 # 3. 🛠️ Optimized yt-dlp Options for Server Hosting
 ydl_opts = {
@@ -166,48 +149,6 @@ def _stop_volume_lock(chat_id):
     volume_lock_levels.pop(chat_id, None)
 
 
-async def _get_ai_reply(chat_id, query):
-    try:
-        # Get recent context from the chat
-        history = []
-        async for message in assistant.get_chat_history(chat_id, limit=8):
-            if message.text:
-                sender = message.from_user.first_name if message.from_user else "User"
-                history.append(f"{sender}: {message.text}")
-        
-        context = "\n".join(reversed(history))
-        
-        prompt = f"""
-        You are a chill Indian friend named Alex. 
-        Tone: Natural Hinglish (Hindi + English mix).
-        Style: Use Gen-Z Indian slang (bro, yaar, scene, sahi hai, bhai).
-        Rules: 
-        - Keep it VERY short (max 10 words).
-        - Use Hinglish like "Bhai kya haal hai?", "Sahi hai yaar!", "Idk bro, dekhte hain".
-        - Don't be robotic. Never say you're an AI.
-        
-        Context:
-        {context}
-        
-        Message from user: {query}
-        Reply in Hinglish:
-        """
-        
-        # Run Ollama local inference
-        print(f"[AI] Thinking for {chat_id}...")
-        response = await asyncio.to_thread(
-            ollama.chat,
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.8, "num_predict": 30}
-        )
-        reply = response['message']['content'].strip()
-        print(f"[AI] Generated: {reply}")
-        return reply
-    except Exception as e:
-        logger.warning(f"Ollama Error: {e}")
-        return random.choice(AUTOCHAT_MESSAGES)
-
 async def _find_vc_service_message(chat_id):
     """Finds the 'Voice Chat Started' service message to reply to."""
     try:
@@ -226,48 +167,6 @@ async def _find_vc_service_message(chat_id):
     except Exception as e:
         logger.warning(f"Error finding VC message: {e}")
     return None
-
-async def _autochat_loop(chat_id):
-    while active_calls.get(chat_id):
-        interval = autochat_intervals.get(chat_id, AUTOCHAT_INTERVAL)
-        try:
-            # 1. Generate AI message
-            msg = await _get_ai_reply(chat_id, "Say something cool to the group.")
-            
-            # 2. Send as a normal message (No more threading to service messages)
-            if msg:
-                await assistant.send_message(chat_id, msg)
-                logger.info(f"Sent Group Comment: {msg[:30]}...")
-            
-        except Exception as e:
-            logger.warning(f"Autochat failed for {chat_id}: {e}")
-        await asyncio.sleep(interval)
-
-
-async def _start_autochat(chat_id, interval=None, message=None):
-    if not active_calls.get(chat_id):
-        raise RuntimeError("Join VC first with joinvc or play before starting autochat.")
-
-    interval = max(15, int(interval or AUTOCHAT_INTERVAL))
-    autochat_intervals[chat_id] = interval
-    if message:
-        autochat_messages[chat_id] = [message.strip()]
-    elif chat_id not in autochat_messages:
-        autochat_messages[chat_id] = AUTOCHAT_MESSAGES
-
-    task = autochat_tasks.get(chat_id)
-    if task and not task.done():
-        task.cancel()
-
-    autochat_tasks[chat_id] = asyncio.create_task(_autochat_loop(chat_id))
-
-
-def _stop_autochat(chat_id):
-    task = autochat_tasks.pop(chat_id, None)
-    if task and not task.done():
-        task.cancel()
-    autochat_intervals.pop(chat_id, None)
-    autochat_messages.pop(chat_id, None)
 
 # --- Shared Play Logic (used by both Telegram commands and CLI) ---
 async def _play_song(chat_id, query, reply_func=None):
@@ -345,7 +244,6 @@ async def _stop_song(chat_id, reply_func=None):
         await call_py.leave_call(chat_id)
         active_calls[chat_id] = False
         _stop_volume_lock(chat_id)
-        _stop_autochat(chat_id)
         await send("Stopped and left VC.", "[*] Stopped and left VC.")
     except Exception:
         await send("Not playing.", "[!] Not playing.")
@@ -397,7 +295,6 @@ async def _end_voice_chat(chat_id, reply_func=None):
         await call_py.leave_call(chat_id, close=True)
         active_calls[chat_id] = False
         _stop_volume_lock(chat_id)
-        _stop_autochat(chat_id)
         await send("Voice chat ended.", "[*] Voice chat ended.")
     except Exception as e:
         await send(f"Could not end voice chat: {e}", f"[X] Could not end voice chat: {e}")
@@ -421,14 +318,6 @@ async def _send_chat_message(chat_id, text, reply_func=None):
         await send("Message sent.", "[OK] Message sent.")
     except Exception as e:
         await send(f"Could not send message: {e}", f"[X] Could not send message: {e}")
-
-
-async def _start_autochat_cli(chat_id, interval, custom_message=None):
-    try:
-        await _start_autochat(chat_id, interval, custom_message)
-        print(f"[OK] Autochat on every {max(15, interval)}s")
-    except Exception as e:
-        print(f"[X] Autochat error: {e}")
 
 
 async def _join_group(link, reply_func=None):
@@ -547,32 +436,6 @@ async def bot_help_handler(client, message):
     await message.reply_text(help_text)
 
 
-# --- Instant AI Responder Handler ---
-@assistant.on_message(filters.group & ~filters.me)
-async def instant_responder_handler(client, message):
-    global AUTO_REPLY_ENABLED
-    
-    if not AUTO_REPLY_ENABLED:
-        return
-    
-    # Check if this is the target chat
-    if CLI_CHAT_ID and message.chat.id != CLI_CHAT_ID:
-        return
-
-    if not message.text:
-        return
-
-    try:
-        # Generate AI reply
-        reply_text = await _get_ai_reply(message.chat.id, message.text)
-        
-        if reply_text:
-            # Human-like fast reply delay
-            await asyncio.sleep(random.uniform(0.5, 1.5))
-            await message.reply_text(reply_text)
-            print(f"[SENT] To {message.from_user.first_name if message.from_user else 'User'}: {reply_text}")
-    except Exception as e:
-        print(f"[Responder Error] {e}")
 async def cli_listener():
     """
     Reads commands from your terminal (stdin) and triggers play/stop in Telegram VC.
@@ -583,8 +446,6 @@ async def cli_listener():
         stop                       - Stop playback and leave VC
         endvc                      - End/close the group voice chat
         msg <text>                 - Send a message to the target group
-        autochat on [secs] [text]  - Send automatic chat messages during VC
-        autochat off               - Stop automatic chat messages
         volume <1-200>             - Set the bot VC volume
         volumelock on [1-200]      - Keep forcing the bot VC volume up
         volumelock off             - Disable volume lock for the target chat
@@ -611,8 +472,6 @@ async def cli_listener():
     print("    stop              - Stop playback")
     print("    endvc             - End/close the group VC")
     print("    msg <text>        - Send message to group chat")
-    print("    autochat on 60    - Send automatic VC chat")
-    print("    autochat off      - Stop automatic VC chat")
     print("    volume <1-200>    - Set VC volume")
     print("    volumelock on 200 - Keep VC volume boosted")
     print("    volumelock off    - Disable volume lock")
@@ -679,44 +538,6 @@ async def cli_listener():
                     continue
                 asyncio.create_task(_send_chat_message(CLI_CHAT_ID, parts[1]))
 
-            elif cmd == "autochat":
-                if not CLI_CHAT_ID:
-                    print("[X] No target chat set! Use: setchat <chat_id>")
-                    continue
-                args = parts[1].split(maxsplit=2) if len(parts) > 1 else ["status"]
-                action = args[0].lower()
-
-                if action in ("off", "stop", "disable"):
-                    _stop_autochat(CLI_CHAT_ID)
-                    print("[OK] Autochat off")
-                    continue
-
-                if action == "status":
-                    task = autochat_tasks.get(CLI_CHAT_ID)
-                    if task and not task.done():
-                        interval = autochat_intervals.get(CLI_CHAT_ID, AUTOCHAT_INTERVAL)
-                        print(f"[*] Autochat is on every {interval}s")
-                    else:
-                        print("[*] Autochat is off")
-                    continue
-
-                if action not in ("on", "start", "enable"):
-                    print("[X] Usage: autochat on [seconds] [message] or autochat off")
-                    continue
-
-                try:
-                    interval = AUTOCHAT_INTERVAL
-                    custom_message = None
-                    if len(args) > 1:
-                        if args[1].isdigit():
-                            interval = int(args[1])
-                            custom_message = args[2] if len(args) > 2 else None
-                        else:
-                            custom_message = " ".join(args[1:])
-                    asyncio.create_task(_start_autochat_cli(CLI_CHAT_ID, interval, custom_message))
-                except Exception as e:
-                    print(f"[X] Autochat error: {e}")
-
             elif cmd in ("volume", "vol"):
                 if len(parts) < 2:
                     print("[X] Usage: volume <1-200>")
@@ -748,18 +569,6 @@ async def cli_listener():
                     print(f"[OK] Volume lock on at {max(1, min(volume, 200))}")
                 except ValueError:
                     print("[X] Usage: volumelock on <1-200> or volumelock off")
-
-            elif cmd == "autoreply":
-                args = parts[1].split() if len(parts) > 1 else ["status"]
-                action = args[0].lower()
-                if action in ("on", "start", "enable"):
-                    AUTO_REPLY_ENABLED = True
-                    print("[OK] Instant Auto-Reply ENABLED")
-                elif action in ("off", "stop", "disable"):
-                    AUTO_REPLY_ENABLED = False
-                    print("[OK] Instant Auto-Reply DISABLED")
-                else:
-                    print(f"[*] Auto-Reply is currently: {'ENABLED' if AUTO_REPLY_ENABLED else 'DISABLED'}")
 
             elif cmd == "setchat":
                 if len(parts) < 2:
@@ -793,8 +602,6 @@ async def cli_listener():
                 print("  stop           - Stop playback and leave VC")
                 print("  endvc          - End/close the group voice chat")
                 print("  msg <text>     - Send a message to the target group")
-                print("  autochat on [seconds] [message] - Send automatic VC chat")
-                print("  autochat off   - Stop automatic VC chat")
                 print("  volume <1-200> - Set bot VC volume")
                 print("  volumelock on [1-200] - Keep forcing bot VC volume")
                 print("  volumelock off - Disable volume lock")
