@@ -6,6 +6,6 @@ WORKDIR /app
 
 COPY . .
 
-RUN pip install -r requirements.txt
+RUN pip install -r champu-bot/requirements.txt
 
-CMD ["python", "bot.py"]
+CMD ["python", "champu-bot/vc_bot.py"]
